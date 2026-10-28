@@ -1,0 +1,39 @@
+# 大数据与数据集文件
+*.hdf5
+*.h5
+*.npz
+*.pkl
+*.tar.gz
+*.gz
+*.zip
+*.ckpt
+*.bin
+*.safetensors
+stapler_backup/
+data/
+eval_result/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# 日志与输出
+logs/
+runs/
+outputs/
+tmp/
+.cache/
+*.log
+*.pid
+
+# 虚拟环境
+venv/
+env/
+.conda/
+
+# 密钥与私密配置
+*.env
+secret*.json
+*.key
