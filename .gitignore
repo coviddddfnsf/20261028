@@ -37,3 +37,7 @@ env/
 *.env
 secret*.json
 *.key
+# macOS 系统缓存
+__MACOSX/
+.DS_Store
+assets/
