@@ -309,6 +309,13 @@ class DETRVAE(nn.Module):
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
         a_hat = self.action_head(hs)
         is_pad_hat = self.is_pad_head(hs)
+        if not is_training and self.latest_alpha is None:
+            # 没有门控分支（gate_type='none'）或力输入被判空时，暴露恒定门控值，
+            # 便于评测端绘制连续 alpha 曲线：纯视觉/无输入 -> 0.0，力参与拼接 -> 1.0
+            alpha_value = 0.0 if force is None else 1.0
+            self.latest_alpha = torch.full(
+                (bs, 1), alpha_value, device=a_hat.device, dtype=a_hat.dtype
+            )
         return a_hat, is_pad_hat, [mu, logvar]
 
 

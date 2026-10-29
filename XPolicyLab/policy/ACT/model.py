@@ -40,6 +40,11 @@ class Model(ModelTemplate):
         """未来力预测序列，供评测脚本计算力预测 MAE 与曲线。"""
         getter = getattr(self.model, "get_force_pred", None)
         return getter() if callable(getter) else None
+
+    def get_step_diagnostics(self):
+        """单步诊断量：门控权重 / 动作块反事实修正 / 是否重规划。"""
+        getter = getattr(self.model, "get_step_diagnostics", None)
+        return getter() if callable(getter) else None
     
     # def update_obs_batch(self, obs_list): # TODO
     #     pass
@@ -54,6 +59,9 @@ class Model(ModelTemplate):
 
     def reset(self):
         self.model.force_history.clear()
+        reset_counterfactual = getattr(self.model, "reset_counterfactual_state", None)
+        if callable(reset_counterfactual):
+            reset_counterfactual()
         # Reset temporal aggregation state if enabled
         if self.model.temporal_agg:
             self.model.all_time_actions = torch.zeros([

@@ -13,6 +13,8 @@ seed: 0
 eval_batch: false
 gate_type: none
 disable_force: false
+# 评测时额外做一次"力信号置零"的反事实前向，记录动作块修正量（因果链分析用）
+record_counterfactual: true
 
 # ACT-specific arguments
 kl_weight: 10.0

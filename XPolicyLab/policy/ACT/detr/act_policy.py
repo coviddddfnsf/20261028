@@ -191,6 +191,27 @@ class ACT:
 
         self.t = 0  # Current timestep
 
+        # === 反事实（无力）前向：为评测记录"力介入如何改变动作决策"的因果证据 ===
+        # 只在带力输入的策略上开启；纯视觉基线（disable_force=True）反事实与真实一致。
+        self.record_counterfactual = bool(
+            args_override.get("record_counterfactual", True)
+        )
+        self.enable_counterfactual = (
+            self.record_counterfactual and not self.disable_force
+        )
+        self.all_actions_noforce = None
+        self._chunk_correction_value = 0.0
+        self._step_action_deltas: list[float] = []
+        # temporal_agg 下的无力动作块窗口 {timestep: [1, num_queries, state_dim]}
+        self._noforce_chunk_window: dict[int, torch.Tensor] = {}
+        self.latest_step_diagnostics = {
+            "alpha": None,
+            "chunk_correction": 0.0,
+            "action_delta_norm": 0.0,
+            "is_replan": 0,
+            "step_action_delta_norms": [],
+        }
+
         # Load policy weights. Missing files are fatal because running with a
         # randomly initialized ACT policy is invalid.
         if not os.path.isfile(ckpt_path):
@@ -249,6 +270,67 @@ class ACT:
     def update_obs(self, obs):
         self.obs_cache = obs
 
+    def get_step_diagnostics(self):
+        """返回最近一步的门控/反事实诊断量，供评测脚本按步记录因果链。"""
+        diagnostics = dict(self.latest_step_diagnostics)
+        if diagnostics.get("alpha") is None:
+            diagnostics["alpha"] = self.get_gate_alpha()
+        return diagnostics
+
+    def reset_counterfactual_state(self):
+        """清空反事实缓存（每个 episode 开始时调用）。"""
+        self.all_actions_noforce = None
+        self._chunk_correction_value = 0.0
+        self._step_action_deltas = []
+        self._noforce_chunk_window.clear()
+        self.latest_step_diagnostics = {
+            "alpha": None,
+            "chunk_correction": 0.0,
+            "action_delta_norm": 0.0,
+            "is_replan": 0,
+            "step_action_delta_norms": [],
+        }
+
+    def _denormalized_chunk(self, chunk):
+        """[B, num_queries, state_dim] 归一化动作块 -> 反归一化 numpy。"""
+        if chunk is None:
+            return None
+        return self.post_process(chunk.detach().cpu().numpy())
+
+    def _chunk_diagnostics(self, actual_chunk, noforce_chunk):
+        """计算动作块级相对修正量与逐时刻单步修正量。"""
+        actual = self._denormalized_chunk(actual_chunk)
+        noforce = self._denormalized_chunk(noforce_chunk)
+        if actual is None or noforce is None:
+            return 0.0, []
+        diff = actual - noforce
+        denominator = float(np.linalg.norm(noforce)) + 1e-6
+        chunk_correction = float(np.linalg.norm(diff) / denominator)
+        step_deltas = [
+            float(np.linalg.norm(diff[:, index])) for index in range(diff.shape[1])
+        ]
+        return chunk_correction, step_deltas
+
+    def _aggregate_noforce(self):
+        """按与 all_time_actions 完全一致的时序加权方式聚合无力动作。"""
+        times = sorted(
+            step
+            for step in self._noforce_chunk_window
+            if step <= self.t < step + self.num_queries
+        )
+        candidates = [
+            self._noforce_chunk_window[step][:, self.t - step] for step in times
+        ]
+        candidates = [row for row in candidates if torch.any(row != 0)]
+        if not candidates:
+            return self.all_actions_noforce[:, self.t % self.query_frequency]
+        stacked = torch.cat(candidates, dim=0)
+        k = 0.01
+        exp_weights = np.exp(-k * np.arange(len(stacked)))
+        exp_weights = exp_weights / exp_weights.sum()
+        exp_weights = torch.from_numpy(exp_weights).to(self.device).unsqueeze(dim=1)
+        return (stacked * exp_weights).sum(dim=0, keepdim=True)
+
     def get_action(self):
         obs = self.obs_cache
 
@@ -300,11 +382,24 @@ class ACT:
 
         with torch.no_grad():
             # Only query the policy at specified intervals - exactly like imitate_episodes.py
-            if self.t % self.query_frequency == 0:
+            replanned = self.t % self.query_frequency == 0
+            if replanned:
+                if self.enable_counterfactual:
+                    # 反事实前向必须先做：随后的真实前向会覆盖 latest_alpha/latest_force_pred，
+                    # 保证对外暴露的门控系数与力预测对应带力输入。
+                    self.all_actions_noforce = self.policy(
+                        qpos, curr_image, force=None, force_seq=None,
+                    )
                 self.all_actions = self.policy(
                     qpos, curr_image, force=force_tensor,
                     force_seq=force_seq_tensor,
                 )
+                if not self.enable_counterfactual:
+                    self.all_actions_noforce = self.all_actions
+                (
+                    self._chunk_correction_value,
+                    self._step_action_deltas,
+                ) = self._chunk_diagnostics(self.all_actions, self.all_actions_noforce)
 
             if self.temporal_agg:
                 # Match temporal aggregation exactly from imitate_episodes.py
@@ -320,13 +415,33 @@ class ACT:
                 exp_weights = (torch.from_numpy(exp_weights).to(self.device).unsqueeze(dim=1))
 
                 raw_action = (actions_for_curr_step * exp_weights).sum(dim=0, keepdim=True)
+                # 无力动作走与上面完全一致的窗口与权重
+                self._noforce_chunk_window[self.t] = self.all_actions_noforce
+                for stale in [step for step in self._noforce_chunk_window
+                              if step <= self.t - self.num_queries]:
+                    del self._noforce_chunk_window[stale]
+                raw_action_noforce = self._aggregate_noforce()
             else:
                 # Direct action selection, same as imitate_episodes.py
-                raw_action = self.all_actions[:, self.t % self.query_frequency]
+                chunk_index = self.t % self.query_frequency
+                raw_action = self.all_actions[:, chunk_index]
+                raw_action_noforce = self.all_actions_noforce[:, chunk_index]
 
         # Denormalize action
         raw_action = raw_action.cpu().numpy()
         action = self.post_process(raw_action)
+        action_noforce = self.post_process(raw_action_noforce.cpu().numpy())
+        action_delta_norm = float(
+            np.linalg.norm(np.ravel(action) - np.ravel(action_noforce))
+        )
+
+        self.latest_step_diagnostics = {
+            "alpha": self.get_gate_alpha(),
+            "chunk_correction": float(self._chunk_correction_value),
+            "action_delta_norm": action_delta_norm,
+            "is_replan": int(replanned),
+            "step_action_delta_norms": list(self._step_action_deltas),
+        }
 
         self.t += 1
         return action

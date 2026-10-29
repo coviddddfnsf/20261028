@@ -224,6 +224,40 @@ bash scripts/eval_policy.sh multitask \
 
 `--policy-server-ip/--policy-server-port` can be repeated to use a server pool, or configured once via `enable_remote` / `policy_server_ip` / `policy_server_port` in the eval config.
 
+### Physics time-series recording (every test episode)
+
+Each evaluation run writes, under `eval_result/{task_name}/ACT/{task_config}/{ckpt_setting}/{timestamp}/`:
+
+* `eval_metrics.json` / `eval_metrics.csv` — per-episode and summary metrics (unchanged schema; `F_max` additionally carries `median`, and `summary.F_max_Robust` holds the trimmed mean/median that drops `F_max > 1000 N` rigid-body tunnelling outliers).
+* `trajectory_curves.npz` / `curves_data.npz` — first successful trajectory (legacy compatibility).
+* `curves_per_episode/ep{episode_id:03d}_seed{seed}.npz` — **all** test seeds, one compressed file each (~15-30 KB), with time-aligned arrays of length `T`:
+
+| Array | Shape | Meaning |
+|---|---|---|
+| `time_step` | `[T]` | step index |
+| `force_vec` | `[T, 6]`/`[T, 12]` | raw contact wrench `[Fx, Fy, Fz, Tx, Ty, Tz]` |
+| `force_norm` | `[T]` | `||f_t||_2` (N) |
+| `contact_gt` / `effective_contact` | `[T]` | geometric contact flag / `force_norm > 0.1 N` |
+| `alpha_gate` | `[T]` | gate weight (soft/attn: learned, hard: 0/1, concat: 1.0, visual-only: 0.0) |
+| `step_chunk_correction` | `[T]` | `||A_actual - A_noforce|| / (||A_noforce|| + 1e-6)` |
+| `step_action_delta_norm` | `[T]` | `||a_t - a_t^noforce||_2` |
+| `is_replan_step` | `[T]` | whether `t` re-planned a new action chunk |
+| `tcp_pos` / `tcp_vel_norm` | `[T,3]` / `[T]` | working-arm TCP position / speed |
+| `obj_progress` / `obj_progress_norm` | `[T]` | target articulation `qpos` or rigid-body height, raw and 0-1 normalized |
+| `step_success` | `[T]` | per-step `check_success()` result |
+| `force_pred`, `success_flag` | `[T]` | predicted force magnitude, episode success flag |
+
+The counterfactual (`*_noforce`) columns come from an extra `torch.no_grad()` forward pass with the force input zeroed, computed on the policy server (`XPolicyLab/policy/ACT`) and exposed through `get_step_diagnostics`. Disable it with `record_counterfactual: false` in `XPolicyLab/policy/ACT/deploy.yml` if the extra forward pass is too expensive.
+
+### Causal-chain analysis & plots
+
+```bash
+python analyze_and_plot_causal_chains.py --task_name press_stapler --task_config demo_clean
+python analyze_and_plot_causal_chains.py --task_name turn_switch --seed 100027 100022
+```
+
+The script ranks Type A (baseline stuck / soft gate succeeds), Type B (all succeed but soft gate lowers force) and Type C (all stuck, baseline overload) seeds over the five experiment groups, then renders a 5×1 shared-timestep figure per seed (contact force → gate weight → action correction → TCP response → object progress/success) plus a same-model success-vs-failure self-comparison, saved as PNG + PDF under `analysis/{task_name}/{task_config}/`.
+
 # 🏄‍♂️ Experiment & LeaderBoard
 
 > We recommend that the RoboTwin Platform can be used to explore the following topics: 

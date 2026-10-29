@@ -727,9 +727,8 @@ def run_one_batch_episode(
 
     succ = False
     recorder = EpisodePhysicsRecorder(frequency=frequency)
-    physics_supported = {"alpha": True, "force_pred": True}
-    pending_alpha = None
-    pending_force_pred = None
+    physics_supported = {"alpha": True, "force_pred": True, "diagnostics": True}
+    pending_diagnostics: dict[str, Any] = {}
     prepare_policy_case(model_client, task_name, seed_value, instruction, action_type)
     reset_policy(model_client)
     try:
@@ -746,7 +745,7 @@ def run_one_batch_episode(
             action_chunk = normalize_action_chunk(model_client.call(func_name="get_action"))
             if len(action_chunk) == 0:
                 raise RuntimeError("Policy returned an empty action chunk.")
-            pending_alpha, pending_force_pred = query_policy_physics(
+            pending_diagnostics = query_policy_diagnostics(
                 model_client, physics_supported
             )
 
@@ -760,9 +759,12 @@ def run_one_batch_episode(
                 recorder.record_step(
                     task_env,
                     observation=observation,
-                    alpha=pending_alpha,
-                    force_pred=pending_force_pred,
+                    alpha=pending_diagnostics.get("alpha"),
+                    force_pred=pending_diagnostics.get("force_pred"),
                     action=flat_action,
+                    diagnostics=step_diagnostics_for_index(
+                        pending_diagnostics, action_idx
+                    ),
                 )
 
                 if task_env.eval_success:
@@ -899,6 +901,16 @@ def _scalar_mean(value: Any) -> float:
     return float(array.mean()) if array.size else float("nan")
 
 
+def _safe_float(value: Any, default: float = float("nan")) -> float:
+    if value is None:
+        return default
+    try:
+        result = float(value)
+    except Exception:
+        return default
+    return result if np.isfinite(result) else default
+
+
 def _fill_nan_columns(series: np.ndarray) -> np.ndarray | None:
     if series.size == 0:
         return None
@@ -916,6 +928,68 @@ def _fill_nan_columns(series: np.ndarray) -> np.ndarray | None:
     return filled
 
 
+def _fill_nan_series(values: np.ndarray) -> np.ndarray:
+    series = np.asarray(values, dtype=np.float32).reshape(-1)
+    if series.size == 0:
+        return series
+    missing = np.isnan(series)
+    if missing.all():
+        return np.zeros_like(series)
+    if missing.any():
+        index = np.arange(series.size)
+        series = series.copy()
+        series[missing] = np.interp(index[missing], index[~missing], series[~missing])
+    return series
+
+
+# 目标物体候选属性的关键字黑名单：机械臂/相机/桌面等环境实体不参与机构进度统计
+PROGRESS_ATTRIBUTE_SKIP = (
+    "robot",
+    "gripper",
+    "camera",
+    "viewer",
+    "scene",
+    "table",
+    "wall",
+    "ground",
+    "floor",
+    "light",
+    "plane",
+)
+
+
+def _iter_progress_candidates(task_env: Any) -> list[tuple[str, str]]:
+    """枚举任务环境里能代表“被操作目标机构进度”的对象（只读、绝不抛异常）。
+
+    返回 [(属性名, 'articulation'|'rigid')]：
+    - articulation：铰接物体，读取主工作关节 qpos（如开关拨动角、订书机下压角）；
+    - rigid：刚体 Actor，读取质心高度 z（如杯子被抬起的高度）。
+    """
+    candidates: list[tuple[str, str]] = []
+    try:
+        attributes = vars(task_env)
+    except Exception:
+        return candidates
+    for name, value in list(attributes.items()):
+        if not isinstance(name, str) or name.startswith("_"):
+            continue
+        lowered = name.lower()
+        if any(keyword in lowered for keyword in PROGRESS_ATTRIBUTE_SKIP):
+            continue
+        try:
+            has_joints = callable(getattr(value, "get_qpos", None)) and callable(
+                getattr(value, "get_qlimits", None)
+            )
+            has_pose = callable(getattr(value, "get_pose", None))
+            if has_joints:
+                candidates.append((name, "articulation"))
+            elif has_pose:
+                candidates.append((name, "rigid"))
+        except Exception:
+            continue
+    return candidates
+
+
 class EpisodePhysicsRecorder:
     """记录一条评估轨迹的力、接触、末端位姿、门控与预测序列。"""
 
@@ -928,6 +1002,17 @@ class EpisodePhysicsRecorder:
         self.alphas: list[float] = []
         self.force_preds: list[np.ndarray | None] = []
         self.actions: list[np.ndarray | None] = []
+        # 因果链时序：力介入 -> 门控响应 -> 动作修正 -> 末端响应 -> 机构进度
+        self.chunk_corrections: list[float] = []
+        self.action_deltas: list[float] = []
+        self.replan_flags: list[float] = []
+        self.step_success: list[float] = []
+        self.diagnostics_seen = False
+        self.progress_candidates: list[tuple[str, str]] | None = None
+        self.progress_joint_index: dict[str, int] = {}
+        self.progress_traces: dict[str, list[float]] = {}
+        self.progress_source: str = "none"
+        self.progress_kind: str = "none"
 
     def record_step(
         self,
@@ -937,6 +1022,7 @@ class EpisodePhysicsRecorder:
         alpha: Any = None,
         force_pred: Any = None,
         action: Any = None,
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         force = contact = None
         compute = getattr(task_env, "_compute_gripper_force", None)
@@ -968,6 +1054,12 @@ class EpisodePhysicsRecorder:
             if vector is not None:
                 pred = vector
 
+        diagnostics = diagnostics or {}
+        if any(
+            key in diagnostics
+            for key in ("chunk_correction", "action_delta_norm", "is_replan")
+        ):
+            self.diagnostics_seen = True
         self.forces.append(force)
         self.contacts.append(contact_value)
         self.tcp_left.append(left if left is not None else nan_pose.copy())
@@ -975,6 +1067,114 @@ class EpisodePhysicsRecorder:
         self.alphas.append(_scalar_mean(alpha))
         self.force_preds.append(pred)
         self.actions.append(_to_float_vector(action))
+        self.chunk_corrections.append(
+            _safe_float(diagnostics.get("chunk_correction"), 0.0)
+        )
+        self.action_deltas.append(
+            _safe_float(diagnostics.get("action_delta_norm"), 0.0)
+        )
+        self.replan_flags.append(
+            1.0 if _safe_float(diagnostics.get("is_replan"), 0.0) > 0.5 else 0.0
+        )
+        self.step_success.append(
+            1.0 if bool(getattr(task_env, "eval_success", False)) else 0.0
+        )
+        self._sample_progress(task_env)
+
+    def _sample_progress(self, task_env: Any) -> None:
+        if self.progress_candidates is None:
+            self.progress_candidates = _iter_progress_candidates(task_env)
+            self.progress_traces = {name: [] for name, _ in self.progress_candidates}
+        for name, kind in self.progress_candidates:
+            self.progress_traces[name].append(
+                self._read_progress(task_env, name, kind)
+            )
+
+    def _read_progress(self, task_env: Any, name: str, kind: str) -> float:
+        try:
+            value = getattr(task_env, name, None)
+            if value is None:
+                return float("nan")
+            if kind == "articulation":
+                qpos = np.asarray(value.get_qpos(), dtype=np.float64).reshape(-1)
+                if qpos.size == 0:
+                    return float("nan")
+                index = self.progress_joint_index.get(name)
+                if index is None:
+                    index = self._primary_joint_index(value, qpos.size)
+                    self.progress_joint_index[name] = index
+                return float(qpos[min(index, qpos.size - 1)])
+            pose = value.get_pose()
+            position = np.asarray(getattr(pose, "p", pose), dtype=np.float64).reshape(-1)
+            return float(position[2]) if position.size >= 3 else float("nan")
+        except Exception:
+            return float("nan")
+
+    @staticmethod
+    def _primary_joint_index(value: Any, size: int) -> int:
+        try:
+            limits = np.asarray(value.get_qlimits(), dtype=np.float64)
+            limits = limits.reshape(-1, 2) if limits.size == size * 2 else limits
+            if limits.ndim != 2 or limits.shape[-1] < 2:
+                return 0
+            spans = np.nan_to_num(limits[:, 1] - limits[:, 0], nan=0.0)
+            if spans.size and float(np.max(spans)) > 1e-6:
+                return int(np.argmax(spans))
+        except Exception:
+            pass
+        return 0
+
+    def _select_progress(self, task_env: Any) -> tuple[np.ndarray, np.ndarray, str, str]:
+        """按轨迹活动度自动挑选最能代表机构进度的通道。"""
+        best: tuple[float, str, str] | None = None
+        for name, kind in (self.progress_candidates or []):
+            values = np.asarray(self.progress_traces.get(name, []), dtype=np.float64)
+            finite = values[np.isfinite(values)]
+            if finite.size == 0:
+                continue
+            score = float(finite.max() - finite.min())
+            if kind == "rigid":
+                # 关节角(rad)与刚体高度(m)量纲不同，刚体通道按 0.5 折价，优先铰接机构
+                score *= 0.5
+            if best is None or score > best[0]:
+                best = (score, name, kind)
+
+        steps = len(self.forces)
+        if best is None:
+            return (
+                np.full(steps, np.nan, dtype=np.float32),
+                np.full(steps, np.nan, dtype=np.float32),
+                "none",
+                "none",
+            )
+        _, name, kind = best
+        raw = _fill_nan_series(self.progress_traces.get(name, []))
+        if kind == "articulation":
+            low, high = self._progress_limits(task_env, name, raw.size)
+            if high - low > 1e-6:
+                norm = np.clip((raw - low) / (high - low), 0.0, 1.0)
+            else:
+                norm = np.zeros_like(raw)
+        else:
+            span = float(np.max(raw) - np.min(raw)) if raw.size else 0.0
+            norm = (raw - float(np.min(raw))) / span if span > 1e-6 else np.zeros_like(raw)
+        return raw.astype(np.float32), norm.astype(np.float32), name, kind
+
+    def _progress_limits(
+        self, task_env: Any, name: str, steps: int
+    ) -> tuple[float, float]:
+        try:
+            value = getattr(task_env, name, None)
+            limits = np.asarray(value.get_qlimits(), dtype=np.float64)
+            if limits.size == steps * 2:
+                limits = limits.reshape(-1, 2)
+            index = self.progress_joint_index.get(name, 0)
+            low, high = float(limits[index][0]), float(limits[index][1])
+            if np.isfinite(low) and np.isfinite(high) and high - low > 1e-6:
+                return low, high
+        except Exception:
+            pass
+        return 0.0, 0.0
 
     def __len__(self) -> int:
         return len(self.forces)
@@ -1112,12 +1312,56 @@ class EpisodePhysicsRecorder:
             ],
             dtype=np.float32,
         )
+
+        steps = int(len(force_norms))
+        chunk_correction_curve = np.asarray(self.chunk_corrections, dtype=np.float32)
+        action_delta_curve = np.asarray(self.action_deltas, dtype=np.float32)
+        if steps and not self.diagnostics_seen and chunk_correction > 0:
+            # 旧服务端不提供逐步反事实诊断时，退化到动作块间差分代理指标
+            chunk_correction_curve = np.full(steps, chunk_correction, dtype=np.float32)
+
+        tcp_pos_curve = (
+            tcp_series.astype(np.float32)
+            if tcp_series is not None and len(tcp_series)
+            else np.full((steps, 3), np.nan, dtype=np.float32)
+        )
+        tcp_vel_norm = np.zeros(steps, dtype=np.float32)
+        if steps >= 2 and not np.all(np.isnan(tcp_pos_curve)):
+            velocity = np.gradient(tcp_pos_curve, self.dt, axis=0)
+            tcp_vel_norm = np.linalg.norm(velocity, axis=1).astype(np.float32)
+            tcp_vel_norm[~np.isfinite(tcp_vel_norm)] = 0.0
+
+        progress_raw, progress_norm, progress_source, progress_kind = (
+            self._select_progress(task_env) if steps else (
+                np.zeros(0, np.float32),
+                np.zeros(0, np.float32),
+                "none",
+                "none",
+            )
+        )
+
         curves = {
-            "time_step": np.arange(len(force_norms), dtype=np.int32),
+            "time_step": np.arange(steps, dtype=np.int32),
+            # 维度一：接触发生与力突变
+            "force_vec": force_matrix.astype(np.float32),
             "force_norm": force_norms.astype(np.float32),
             "contact_gt": contacts.astype(np.float32),
+            "effective_contact": (force_norms > CONTACT_THRESHOLD).astype(np.int8),
+            # 维度二：门控权重响应
             "alpha_gate": np.asarray(self.alphas, dtype=np.float32),
             "force_pred": force_pred_curve,
+            # 维度三：反事实动作修正
+            "step_chunk_correction": chunk_correction_curve,
+            "step_action_delta_norm": action_delta_curve,
+            "is_replan_step": np.asarray(self.replan_flags, dtype=np.int8),
+            # 维度四：末端空间响应
+            "tcp_pos": tcp_pos_curve,
+            "tcp_vel_norm": tcp_vel_norm,
+            # 维度五：目标机构进度与成功跨越
+            "obj_progress": progress_raw,
+            "obj_progress_norm": progress_norm,
+            "step_success": np.asarray(self.step_success, dtype=np.int8),
+            "success_flag": np.full(steps, 1 if success else 0, dtype=np.int8),
         }
 
         return {
@@ -1134,6 +1378,8 @@ class EpisodePhysicsRecorder:
             "force_var": force_var,
             "force_mae": force_mae,
             "chunk_correction": chunk_correction,
+            "obj_progress_source": progress_source,
+            "obj_progress_kind": progress_kind,
             "curves": curves,
         }
 
@@ -1141,12 +1387,41 @@ class EpisodePhysicsRecorder:
 def _finite_stat(values: list[float]) -> dict[str, float]:
     finite = [value for value in values if value is not None and np.isfinite(value)]
     if not finite:
-        return {"mean": float("nan"), "std": float("nan"), "count": 0}
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "median": float("nan"),
+            "count": 0,
+        }
     array = np.asarray(finite, dtype=np.float64)
     return {
         "mean": float(array.mean()),
         "std": float(array.std()),
+        "median": float(np.median(array)),
         "count": int(array.size),
+    }
+
+
+# 物理引擎穿模会产生百牛/千牛级奇异接触力，统计时单独截尾
+OUTLIER_FORCE_THRESHOLD = 1000.0
+
+
+def _robust_stat(values: list[float], upper: float = OUTLIER_FORCE_THRESHOLD) -> dict[str, float]:
+    finite = [value for value in values if value is not None and np.isfinite(value)]
+    array = np.asarray(finite, dtype=np.float64)
+    if array.size == 0:
+        return {
+            "trimmed_mean": float("nan"),
+            "median": float("nan"),
+            "count": 0,
+            "outliers": 0,
+        }
+    kept = array[array <= upper]
+    return {
+        "trimmed_mean": float(kept.mean()) if kept.size else float("nan"),
+        "median": float(np.median(array)),
+        "count": int(kept.size),
+        "outliers": int(array.size - kept.size),
     }
 
 
@@ -1169,6 +1444,7 @@ def summarize_physics_metrics(episodes: list[dict[str, Any]]) -> dict[str, Any]:
         "Force_Var": _finite_stat([episode["force_var"] for episode in episodes]),
         "Force_MAE": _finite_stat([episode["force_mae"] for episode in episodes]),
         "Chunk_Correction": _finite_stat([episode["chunk_correction"] for episode in episodes]),
+        "F_max_Robust": _robust_stat([episode["f_max"] for episode in episodes]),
         "Fail_Type": fail_counts,
     }
 
@@ -1182,7 +1458,17 @@ def print_physics_metrics(summary: Mapping[str, Any]) -> None:
         if stat["count"] == 0:
             print(f"{label}: N/A")
         else:
-            print(f"{label}: {stat['mean']:.4f} ± {stat['std']:.4f} (n={stat['count']})")
+            print(
+                f"{label}: {stat['mean']:.4f} ± {stat['std']:.4f} "
+                f"(median={stat.get('median', float('nan')):.4f}, n={stat['count']})"
+            )
+    robust = summary.get("F_max_Robust")
+    if robust and robust.get("count", 0) > 0:
+        print(
+            f"F_max (剔除 >{OUTLIER_FORCE_THRESHOLD:.0f} N 穿模奇异点): "
+            f"trimmed_mean={robust['trimmed_mean']:.4f}, median={robust['median']:.4f}, "
+            f"outliers={robust['outliers']}, n={robust['count']}"
+        )
     fail = summary["Fail_Type"]
     print(
         "Fail_Type: "
@@ -1243,6 +1529,8 @@ def save_physics_metrics(
         "force_var",
         "force_mae",
         "chunk_correction",
+        "obj_progress_source",
+        "obj_progress_kind",
     ]
     with open(result_dir / "eval_metrics.csv", "w", encoding="utf-8") as file:
         file.write(",".join(csv_fields) + "\n")
@@ -1257,27 +1545,80 @@ def save_physics_metrics(
     # 需求文档中也使用 curves_data.npz 命名，保持两份一致便于直接读取
     np.savez(result_dir / "curves_data.npz", **curve_episode["curves"])
 
+    # 全部种子的完整时序落盘，供评测后离线筛选"基线卡死 / 门控救回"的典型种子
+    per_episode_dir = result_dir / "curves_per_episode"
+    per_episode_dir.mkdir(parents=True, exist_ok=True)
+    for episode in episodes:
+        curves = episode.get("curves")
+        if not curves:
+            continue
+        filename = f"ep{int(episode['episode_id']):03d}_seed{int(episode['seed'])}.npz"
+        np.savez_compressed(per_episode_dir / filename, **curves)
+
     print_physics_metrics(summary)
     print(f"Physics metrics saved to {result_dir}")
+    print(f"Per-episode curves saved to {per_episode_dir} ({len(episodes)} episodes)")
 
 
-def query_policy_physics(
+def query_policy_diagnostics(
     model_client, supported: dict[str, bool]
-) -> tuple[Any, Any]:
-    alpha = force_pred = None
-    if supported.get("alpha", True):
+) -> dict[str, Any]:
+    """一次取回门控系数、力预测与反事实动作修正诊断量。
+
+    新版服务端提供 get_step_diagnostics 时只走一次 RPC；老服务端自动退化为
+    分别调用 get_gate_alpha / get_force_pred。
+    """
+    diagnostics: dict[str, Any] = {}
+    if supported.get("diagnostics", True):
         try:
-            alpha = model_client.call(func_name="get_gate_alpha")
+            value = model_client.call(func_name="get_step_diagnostics")
+        except Exception:
+            value = None
+        if isinstance(value, Mapping):
+            diagnostics = dict(value)
+            supported["alpha"] = True
+            supported["force_pred"] = True
+        else:
+            supported["diagnostics"] = False
+
+    if diagnostics.get("alpha") is None and supported.get("alpha", True):
+        try:
+            diagnostics["alpha"] = model_client.call(func_name="get_gate_alpha")
         except Exception:
             supported["alpha"] = False
-            alpha = None
-    if supported.get("force_pred", True):
+    if diagnostics.get("force_pred") is None and supported.get("force_pred", True):
         try:
-            force_pred = model_client.call(func_name="get_force_pred")
+            diagnostics["force_pred"] = model_client.call(func_name="get_force_pred")
         except Exception:
             supported["force_pred"] = False
-            force_pred = None
-    return alpha, force_pred
+    return diagnostics
+
+
+def step_diagnostics_for_index(
+    diagnostics: Mapping[str, Any], action_idx: int
+) -> dict[str, float]:
+    """把"每个 Action Chunk 一次"的诊断量摊平到 Chunk 内的每一步。"""
+    if not any(
+        key in diagnostics
+        for key in ("chunk_correction", "action_delta_norm", "is_replan")
+    ):
+        # 老服务端没有反事实诊断，保持空字典，由 recorder 退化到代理指标
+        return {}
+    chunk_correction = _safe_float(diagnostics.get("chunk_correction"), 0.0)
+    if action_idx == 0:
+        action_delta = _safe_float(diagnostics.get("action_delta_norm"), 0.0)
+        is_replan = _safe_float(diagnostics.get("is_replan"), 1.0)
+    else:
+        deltas = diagnostics.get("step_action_delta_norms") or []
+        action_delta = (
+            _safe_float(deltas[action_idx], 0.0) if action_idx < len(deltas) else 0.0
+        )
+        is_replan = 0.0
+    return {
+        "chunk_correction": chunk_correction,
+        "action_delta_norm": action_delta,
+        "is_replan": is_replan,
+    }
 
 
 def eval_remote_policy(
@@ -1309,7 +1650,7 @@ def eval_remote_policy(
     args["eval_mode"] = True
     consecutive_env_errors = 0
     episode_metrics: list[dict[str, Any]] = []
-    physics_supported = {"alpha": True, "force_pred": True}
+    physics_supported = {"alpha": True, "force_pred": True, "diagnostics": True}
 
     while succ_seed < test_num:
         render_freq = args["render_freq"]
@@ -1391,8 +1732,7 @@ def eval_remote_policy(
         rollout_steps = 0
         rollout_failed = False
         recorder = EpisodePhysicsRecorder(frequency=frequency)
-        pending_alpha = None
-        pending_force_pred = None
+        pending_diagnostics: dict[str, Any] = {}
         prepare_policy_case(model_client, task_name, now_seed, instruction, action_type)
         reset_policy(model_client)
         try:
@@ -1409,7 +1749,7 @@ def eval_remote_policy(
                 action_chunk = normalize_action_chunk(model_client.call(func_name="get_action"))
                 if len(action_chunk) == 0:
                     raise RuntimeError("Policy returned an empty action chunk.")
-                pending_alpha, pending_force_pred = query_policy_physics(
+                pending_diagnostics = query_policy_diagnostics(
                     model_client, physics_supported
                 )
 
@@ -1424,9 +1764,12 @@ def eval_remote_policy(
                     recorder.record_step(
                         task_env,
                         observation=observation,
-                        alpha=pending_alpha,
-                        force_pred=pending_force_pred,
+                        alpha=pending_diagnostics.get("alpha"),
+                        force_pred=pending_diagnostics.get("force_pred"),
                         action=flat_action,
+                        diagnostics=step_diagnostics_for_index(
+                            pending_diagnostics, action_idx
+                        ),
                     )
 
                     if task_env.eval_success:
